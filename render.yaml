@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: darija-desk
+    runtime: node
+    plan: starter
+    region: frankfurt
+    buildCommand: npm ci && npm run build
+    startCommand: node dist/server.js
+    healthCheckPath: /health
+    disk:
+      name: darija-desk-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: LOCAL_DATA_FILE
+        value: /var/data/local-store.json
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: REGISTRATION_INVITE_CODE
+        generateValue: true
+      - key: AWS_REGION
+        sync: false
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false

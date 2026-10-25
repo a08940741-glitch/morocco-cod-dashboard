@@ -1,0 +1,22 @@
+{
+  "name": "claude-whatsapp-ai",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --env-file=.env --import tsx --watch src/server.ts",
+    "start": "node --env-file=.env dist/server.js",
+    "build": "tsc -p tsconfig.json",
+    "test": "tsx --test test/app.test.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sns": "^3.1156.0",
+    "fastify": "^5.6.2",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^24.9.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}
