@@ -1,15 +1,15 @@
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import { createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import { z, ZodError } from "zod";
 import type { AppConfig } from "./config.js";
-import { AdminAccountStore } from "./admin-account.js";
+import { AdminAccountStore, type AdminAccountRole } from "./admin-account.js";
 import { dashboardHtml } from "./dashboard.js";
 import { findProduct, hasAvailableStock, products } from "./catalog.js";
 import { AppError } from "./errors.js";
 import { MockClaudeProvider, MockWhatsAppAdapter } from "./mocks.js";
 import { normalizeMoroccanPhone } from "./phone.js";
 import { AwsSnsSmsProvider, type SmsProvider } from "./sms.js";
-import { createLocalStore, orderStatuses, type Conversation, type Order, type OrderStatus, type LocalStore } from "./store.js";
+import { createAccountStore, orderStatuses, type Conversation, type Order, type OrderStatus, type LocalStore } from "./store.js";
 
 const orderInputSchema = z.object({
   customerName: z.string().trim().min(1).max(100),
@@ -68,10 +68,21 @@ interface PendingRegistration {
   attempts: number;
 }
 
+interface UserSession {
+  expiresAt: number;
+  accountKey: string;
+  role: AdminAccountRole;
+}
+
+interface AccountRequestContext {
+  store: LocalStore;
+  session: UserSession;
+}
+
 export interface AppDependencies {
   whatsapp: MockWhatsAppAdapter;
   claude: MockClaudeProvider;
-  store?: LocalStore;
+  storeFactory?: (accountKey: string) => LocalStore;
   sms?: SmsProvider;
 }
 
@@ -80,23 +91,62 @@ export function createApp(
   dependencies: AppDependencies = {
     whatsapp: new MockWhatsAppAdapter(),
     claude: new MockClaudeProvider(),
-    store: createLocalStore(config.NODE_ENV, config.LOCAL_DATA_FILE),
     sms: new AwsSnsSmsProvider(config.AWS_REGION),
   },
 ): FastifyInstance {
   const app = Fastify({
     logger: { level: config.LOG_LEVEL },
   });
-  const store = dependencies.store ?? createLocalStore(config.NODE_ENV, config.LOCAL_DATA_FILE);
-  const orders = store.orders;
-  const conversations = store.conversations;
   const accountStore = new AdminAccountStore(`${config.LOCAL_DATA_FILE}.admin-account.json`);
   const sms = dependencies.sms ?? new AwsSnsSmsProvider(config.AWS_REGION);
-  const sessions = new Map<string, number>();
+  const sessions = new Map<string, UserSession>();
+  const accountStores = new Map<string, LocalStore>();
+  const requestContexts = new WeakMap<FastifyRequest, AccountRequestContext>();
+  const createStore = dependencies.storeFactory ?? ((accountKey: string) => createAccountStore(
+    config.NODE_ENV,
+    config.LOCAL_DATA_FILE,
+    accountKey,
+    accountStore.firstAccountUsername,
+  ));
   const loginAttempts = new Map<string, LoginAttempts>();
   const registrationAttempts = new Map<string, LoginAttempts>();
   const pendingRegistrations = new Map<string, PendingRegistration>();
   const verificationResends = new Map<string, number>();
+
+  function storeForAccount(accountKey: string): LocalStore {
+    let store = accountStores.get(accountKey);
+    if (!store) {
+      store = createStore(accountKey);
+      accountStores.set(accountKey, store);
+    }
+    return store;
+  }
+
+  function storeForRequest(request: FastifyRequest): LocalStore {
+    const context = requestContexts.get(request);
+    if (!context) throw new Error("Authenticated request is missing its account context.");
+    return context.store;
+  }
+
+  function contextForRequest(request: FastifyRequest): AccountRequestContext {
+    const context = requestContexts.get(request);
+    if (!context) throw new Error("Authenticated request is missing its account context.");
+    return context;
+  }
+
+  function productsForAccount(store: LocalStore) {
+    return products.map((product) => ({
+      ...product,
+      stock: store.productStocks.get(product.id) ?? product.stock,
+    }));
+  }
+
+  function productForAccount(store: LocalStore, productId: string) {
+    const product = products.find((candidate) => candidate.id === productId);
+    return product
+      ? { ...product, stock: store.productStocks.get(product.id) ?? product.stock }
+      : undefined;
+  }
 
   function getSessionToken(cookieHeader: string | undefined): string | undefined {
     const cookie = cookieHeader?.split(";").map((part) => part.trim())
@@ -153,11 +203,27 @@ export function createApp(
     }
 
     const token = getSessionToken(request.headers.cookie);
-    const expiresAt = token ? sessions.get(token) : undefined;
-    if (!token || expiresAt === undefined || expiresAt <= Date.now()) {
+    const session = token ? sessions.get(token) : undefined;
+    if (!token || !session || session.expiresAt <= Date.now()) {
       if (token) sessions.delete(token);
       return reply.code(401).send({ error: "Authentication required.", code: "UNAUTHENTICATED" });
     }
+    const requestedStore = request.headers["x-store-account"];
+    let accountKey = session.accountKey;
+    if (requestedStore !== undefined) {
+      if (session.role !== "owner") {
+        return reply.code(403).send({ error: "Only the site owner can switch stores.", code: "STORE_ACCESS_DENIED" });
+      }
+      if (Array.isArray(requestedStore)) {
+        return reply.code(400).send({ error: "Invalid store selection.", code: "INVALID_STORE" });
+      }
+      const canonicalUsername = accountStore.getUsername(requestedStore);
+      if (!canonicalUsername) {
+        return reply.code(404).send({ error: "Store not found.", code: "STORE_NOT_FOUND" });
+      }
+      accountKey = canonicalUsername.toLocaleLowerCase();
+    }
+    requestContexts.set(request, { store: storeForAccount(accountKey), session });
   });
 
   app.get("/health", async () => ({ status: "ok" }));
@@ -169,8 +235,13 @@ export function createApp(
 
   app.get("/auth/session", async (request) => {
     const token = getSessionToken(request.headers.cookie);
-    const expiresAt = token ? sessions.get(token) : undefined;
-    return { authenticated: Boolean(expiresAt && expiresAt > Date.now()) };
+    const session = token ? sessions.get(token) : undefined;
+    if (!session || session.expiresAt <= Date.now()) return { authenticated: false };
+    return {
+      authenticated: true,
+      role: session.role,
+      username: accountStore.getUsername(session.accountKey),
+    };
   });
 
   app.get("/auth/setup", async () => ({
@@ -178,6 +249,14 @@ export function createApp(
     registrationEnabled: true,
     registrationRequiresInvite: Boolean(config.REGISTRATION_INVITE_CODE),
   }));
+
+  app.get("/auth/stores", async (request, reply) => {
+    const { session } = contextForRequest(request);
+    if (session.role !== "owner") {
+      return reply.code(403).send({ error: "Only the site owner can list stores.", code: "STORE_ACCESS_DENIED" });
+    }
+    return { stores: accountStore.listStores() };
+  });
 
   app.post("/auth/registration/start", async (request, reply) => {
     const input = registrationSchema.parse(request.body);
@@ -276,7 +355,14 @@ export function createApp(
     pendingRegistrations.delete(input.token);
     const sessionId = randomBytes(32).toString("hex");
     const signature = createHmac("sha256", config.SESSION_SECRET).update(sessionId).digest("hex");
-    sessions.set(sessionId, Date.now() + sessionDurationMs);
+    const accountKey = pending.profile.username.toLocaleLowerCase();
+    const role = accountStore.getRole(accountKey);
+    if (!role) throw new Error("The newly created account is missing its role.");
+    sessions.set(sessionId, {
+      expiresAt: Date.now() + sessionDurationMs,
+      accountKey,
+      role,
+    });
     loginAttempts.delete(request.ip);
     return reply
       .header("set-cookie", sessionCookie(`${sessionId}.${signature}`, sessionDurationMs / 1000))
@@ -309,12 +395,19 @@ export function createApp(
     }
 
     loginAttempts.delete(request.ip);
-    for (const [sessionId, expiresAt] of sessions) {
-      if (expiresAt <= now) sessions.delete(sessionId);
+    for (const [sessionId, session] of sessions) {
+      if (session.expiresAt <= now) sessions.delete(sessionId);
     }
     const sessionId = randomBytes(32).toString("hex");
     const signature = createHmac("sha256", config.SESSION_SECRET).update(sessionId).digest("hex");
-    sessions.set(sessionId, now + sessionDurationMs);
+    const accountKey = input.username.toLocaleLowerCase();
+    const role = accountStore.getRole(accountKey);
+    if (!role) throw new Error("The authenticated account is missing its role.");
+    sessions.set(sessionId, {
+      expiresAt: now + sessionDurationMs,
+      accountKey,
+      role,
+    });
     return reply
       .header("set-cookie", sessionCookie(`${sessionId}.${signature}`, sessionDurationMs / 1000))
       .header("cache-control", "no-store")
@@ -330,14 +423,15 @@ export function createApp(
       .send({ authenticated: false });
   });
 
-  app.get("/products", async () => ({ products }));
+  app.get("/products", async (request) => ({ products: productsForAccount(storeForRequest(request)) }));
 
-  app.get("/orders", async () => ({ orders: [...orders.values()] }));
+  app.get("/orders", async (request) => ({ orders: [...storeForRequest(request).orders.values()] }));
 
   app.post("/orders", async (request, reply) => {
+    const store = storeForRequest(request);
     const input = orderInputSchema.parse(request.body);
     const phone = normalizeMoroccanPhone(input.phone);
-    const product = findProduct(input.productId);
+    const product = productForAccount(store, input.productId);
     if (!product) {
       throw new AppError("Product not found.", 404, "PRODUCT_NOT_FOUND");
     }
@@ -345,7 +439,7 @@ export function createApp(
       throw new AppError("Product is out of stock for that quantity.", 409, "OUT_OF_STOCK");
     }
 
-    product.stock -= input.quantity;
+    store.productStocks.set(product.id, product.stock - input.quantity);
 
     const order: Order = {
       id: randomUUID(),
@@ -359,7 +453,7 @@ export function createApp(
       address: input.address,
       status: "awaiting_confirmation",
     };
-    orders.set(order.id, order);
+    store.orders.set(order.id, order);
     store.save();
     return reply.code(201).send({
       order,
@@ -369,8 +463,9 @@ export function createApp(
   });
 
   app.post<{ Params: { orderId: string } }>("/orders/:orderId/confirm", async (request) => {
+    const store = storeForRequest(request);
     confirmationSchema.parse(request.body);
-    const order = orders.get(request.params.orderId);
+    const order = store.orders.get(request.params.orderId);
     if (!order) {
       throw new AppError("Order not found.", 404, "ORDER_NOT_FOUND");
     }
@@ -386,8 +481,9 @@ export function createApp(
   });
 
   app.patch<{ Params: { orderId: string } }>("/orders/:orderId/status", async (request) => {
+    const store = storeForRequest(request);
     const input = orderStatusSchema.parse(request.body);
-    const order = orders.get(request.params.orderId);
+    const order = store.orders.get(request.params.orderId);
     if (!order) {
       throw new AppError("Order not found.", 404, "ORDER_NOT_FOUND");
     }
@@ -403,9 +499,9 @@ export function createApp(
       throw new AppError("Order status transition is not allowed.", 409, "INVALID_ORDER_TRANSITION");
     }
     if (input.status === "cancelled" && order.status !== "cancelled") {
-      const product = findProduct(order.productId);
+      const product = productForAccount(store, order.productId);
       if (product) {
-        product.stock += order.quantity;
+        store.productStocks.set(product.id, product.stock + order.quantity);
       }
     }
     order.status = input.status;
@@ -414,19 +510,23 @@ export function createApp(
   });
 
   app.patch<{ Params: { productId: string } }>("/products/:productId/stock", async (request) => {
+    const store = storeForRequest(request);
     const input = productStockSchema.parse(request.body);
-    const product = findProduct(request.params.productId);
+    const product = productForAccount(store, request.params.productId);
     if (!product) {
       throw new AppError("Product not found.", 404, "PRODUCT_NOT_FOUND");
     }
-    product.stock = input.stock;
+    store.productStocks.set(product.id, input.stock);
     store.save();
-    return { product };
+    return { product: { ...product, stock: input.stock } };
   });
 
-  app.get("/conversations", async () => ({ conversations: [...conversations.values()] }));
+  app.get("/conversations", async (request) => ({
+    conversations: [...storeForRequest(request).conversations.values()],
+  }));
 
   app.post("/conversations", async (request, reply) => {
+    const store = storeForRequest(request);
     const input = conversationInputSchema.parse(request.body);
     const conversation: Conversation = {
       id: randomUUID(),
@@ -434,14 +534,15 @@ export function createApp(
       status: "ai",
       messages: [],
     };
-    conversations.set(conversation.id, conversation);
+    store.conversations.set(conversation.id, conversation);
     store.save();
     return reply.code(201).send({ conversation });
   });
 
   app.post<{ Params: { conversationId: string } }>("/conversations/:conversationId/messages", async (request) => {
+    const store = storeForRequest(request);
     const input = messageInputSchema.parse(request.body);
-    const conversation = conversations.get(request.params.conversationId);
+    const conversation = store.conversations.get(request.params.conversationId);
     if (!conversation) {
       throw new AppError("Conversation not found.", 404, "CONVERSATION_NOT_FOUND");
     }
@@ -452,7 +553,7 @@ export function createApp(
       return { conversation, automatedReply: false, handoffReason: conversation.handoffReason };
     }
 
-    const response = await dependencies.claude.reply(input.text);
+    const response = await dependencies.claude.reply(input.text, productsForAccount(store));
     await dependencies.whatsapp.sendMessage(conversation.phone, response);
     conversation.messages.push({
       role: "assistant",
@@ -464,8 +565,9 @@ export function createApp(
   });
 
   app.post<{ Params: { conversationId: string } }>("/conversations/:conversationId/replies", async (request) => {
+    const store = storeForRequest(request);
     const input = replyInputSchema.parse(request.body);
-    const conversation = conversations.get(request.params.conversationId);
+    const conversation = store.conversations.get(request.params.conversationId);
     if (!conversation) {
       throw new AppError("Conversation not found.", 404, "CONVERSATION_NOT_FOUND");
     }
@@ -478,8 +580,9 @@ export function createApp(
   });
 
   app.post<{ Params: { conversationId: string } }>("/conversations/:conversationId/handoff", async (request) => {
+    const store = storeForRequest(request);
     const input = handoffInputSchema.parse(request.body);
-    const conversation = conversations.get(request.params.conversationId);
+    const conversation = store.conversations.get(request.params.conversationId);
     if (!conversation) {
       throw new AppError("Conversation not found.", 404, "CONVERSATION_NOT_FOUND");
     }

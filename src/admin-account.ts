@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { z } from "zod";
 
-const accountSchema = z.object({
+const accountDataSchema = z.object({
   username: z.string().min(3).max(100),
   fullName: z.string().max(100).default(""),
   email: z.string().max(254).default(""),
@@ -12,13 +12,19 @@ const accountSchema = z.object({
   salt: z.string().regex(/^[a-f0-9]{64}$/),
   passwordHash: z.string().regex(/^[a-f0-9]{64}$/),
 });
+const accountSchema = accountDataSchema.extend({ role: z.enum(["owner", "admin"]) });
 const accountsFileSchema = z.object({
-  version: z.literal(2),
+  version: z.literal(3),
   accounts: z.array(accountSchema),
 });
-const legacyAccountFileSchema = accountSchema.extend({ version: z.literal(1) });
+const previousAccountsFileSchema = z.object({
+  version: z.literal(2),
+  accounts: z.array(accountDataSchema),
+});
+const legacyAccountFileSchema = accountDataSchema.extend({ version: z.literal(1) });
 
 type AdminAccount = z.infer<typeof accountSchema>;
+export type AdminAccountRole = AdminAccount["role"];
 
 export class AdminAccountStore {
   private readonly filePath: string;
@@ -34,9 +40,19 @@ export class AdminAccountStore {
         return;
       }
 
+      const previous = previousAccountsFileSchema.safeParse(parsed);
+      if (previous.success) {
+        this.accounts = previous.data.accounts.map((account, index) => ({
+          ...account,
+          role: index === 0 ? "owner" : "admin",
+        }));
+        this.save();
+        return;
+      }
+
       const legacy = legacyAccountFileSchema.parse(parsed);
       const { version: _version, ...account } = legacy;
-      this.accounts = [account];
+      this.accounts = [{ ...account, role: "owner" }];
       this.save();
     } catch (error) {
       if (isMissingFile(error)) return;
@@ -46,6 +62,22 @@ export class AdminAccountStore {
 
   get isConfigured(): boolean {
     return this.accounts.length > 0;
+  }
+
+  get firstAccountUsername(): string | undefined {
+    return this.accounts[0]?.username;
+  }
+
+  getRole(username: string): AdminAccountRole | undefined {
+    return this.findAccount(username)?.role;
+  }
+
+  getUsername(username: string): string | undefined {
+    return this.findAccount(username)?.username;
+  }
+
+  listStores(): Array<{ username: string; storeName: string }> {
+    return this.accounts.map(({ username, storeName }) => ({ username, storeName }));
   }
 
   isTaken(username: string, email: string): boolean {
@@ -61,6 +93,7 @@ export class AdminAccountStore {
     const salt = randomBytes(32).toString("hex");
     const account: AdminAccount = {
       ...profile,
+      role: this.accounts.length === 0 ? "owner" : "admin",
       salt,
       passwordHash: scryptSync(password, salt, 32).toString("hex"),
     };
@@ -75,7 +108,7 @@ export class AdminAccountStore {
   }
 
   verify(username: string, password: string): boolean {
-    const account = this.accounts.find((candidate) => candidate.username.toLocaleLowerCase() === username.toLocaleLowerCase());
+    const account = this.findAccount(username);
     if (!account) return false;
     const supplied = scryptSync(password, account.salt, 32);
     const expected = Buffer.from(account.passwordHash, "hex");
@@ -88,10 +121,15 @@ export class AdminAccountStore {
     mkdirSync(directory, { recursive: true });
     writeFileSync(
       temporaryPath,
-      `${JSON.stringify({ version: 2, accounts: this.accounts }, null, 2)}\n`,
+      `${JSON.stringify({ version: 3, accounts: this.accounts }, null, 2)}\n`,
       { encoding: "utf8", mode: 0o600 },
     );
     renameSync(temporaryPath, this.filePath);
+  }
+
+  private findAccount(username: string): AdminAccount | undefined {
+    const normalizedUsername = username.toLocaleLowerCase();
+    return this.accounts.find((candidate) => candidate.username.toLocaleLowerCase() === normalizedUsername);
   }
 }
 

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID, scryptSync } from "node:crypto";
 import { afterEach, describe, it } from "node:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Script } from "node:vm";
@@ -36,11 +36,15 @@ const config = loadConfig({
 
 describe("local support prototype", () => {
   const apps: ReturnType<typeof createApp>[] = [];
+  const temporaryDirectories: string[] = [];
   const cookies = new WeakMap<FastifyInstance, string>();
   const verificationCodes = new WeakMap<FastifyInstance, string>();
 
   afterEach(async () => {
     await Promise.all(apps.splice(0).map((app) => app.close()));
+    for (const directory of temporaryDirectories.splice(0)) {
+      rmSync(directory, { recursive: true, force: true });
+    }
     rmSync(accountFile, { force: true });
   });
 
@@ -152,6 +156,12 @@ describe("local support prototype", () => {
       payload: { username: "second-admin", password: testPassword },
     });
     assert.equal(anotherLogin.statusCode, 200);
+    const secondSession = await restartedApp.inject({
+      method: "GET",
+      url: "/auth/session",
+      headers: { cookie: (anotherLogin.headers["set-cookie"] as string).split(";")[0] ?? "" },
+    });
+    assert.equal(secondSession.json().role, "admin");
   });
 
   it("limits repeated failed login attempts", async () => {
@@ -263,6 +273,235 @@ describe("local support prototype", () => {
     assert.equal(verificationCodes.has(app), true);
   });
 
+  it("isolates orders, conversations, and inventory between registered accounts", async () => {
+    const app = createTestApp();
+    const first = await registerAccount(app, registrationPayload(testUsername));
+    assert.equal(first.verified?.statusCode, 201);
+    const firstCookie = (first.verified?.headers["set-cookie"] as string).split(";")[0] ?? "";
+    const ownerSession = await app.inject({ method: "GET", url: "/auth/session", headers: { cookie: firstCookie } });
+    assert.equal(ownerSession.json().role, "owner");
+
+    const firstOrder = await app.inject({
+      method: "POST",
+      url: "/orders",
+      headers: { cookie: firstCookie },
+      payload: {
+        customerName: "Synthetic Customer One",
+        phone: "0612345678",
+        productId: "argan-oil-100",
+        quantity: 1,
+        address: "Synthetic Test Address, Rabat",
+      },
+    });
+    assert.equal(firstOrder.statusCode, 201);
+    const firstConversation = await app.inject({
+      method: "POST",
+      url: "/conversations",
+      headers: { cookie: firstCookie },
+      payload: { phone: "0612345678" },
+    });
+    assert.equal(firstConversation.statusCode, 201);
+    const stockUpdate = await app.inject({
+      method: "PATCH",
+      url: "/products/argan-oil-100/stock",
+      headers: { cookie: firstCookie },
+      payload: { stock: 2 },
+    });
+    assert.equal(stockUpdate.statusCode, 200);
+
+    const second = await registerAccount(app, registrationPayload("second-admin", "second@example.com", "0622345678"));
+    assert.equal(second.verified?.statusCode, 201);
+    const secondCookie = (second.verified?.headers["set-cookie"] as string).split(";")[0] ?? "";
+    const stores = await app.inject({ method: "GET", url: "/auth/stores", headers: { cookie: firstCookie } });
+    assert.equal(stores.json().stores.length, 2);
+    assert.equal(stores.json().stores[0].username, testUsername);
+    const nonOwnerStores = await app.inject({ method: "GET", url: "/auth/stores", headers: { cookie: secondCookie } });
+    assert.equal(nonOwnerStores.statusCode, 403);
+    const secondOrders = await app.inject({ method: "GET", url: "/orders", headers: { cookie: secondCookie } });
+    const secondConversations = await app.inject({ method: "GET", url: "/conversations", headers: { cookie: secondCookie } });
+    const secondProducts = await app.inject({ method: "GET", url: "/products", headers: { cookie: secondCookie } });
+    assert.equal(secondOrders.json().orders.length, 0);
+    assert.equal(secondConversations.json().conversations.length, 0);
+    assert.equal(secondProducts.json().products.find((product: { id: string }) => product.id === "argan-oil-100").stock, 18);
+    const deniedStoreSwitch = await app.inject({
+      method: "GET",
+      url: "/orders",
+      headers: { cookie: secondCookie, "x-store-account": testUsername },
+    });
+    assert.equal(deniedStoreSwitch.statusCode, 403);
+
+    const inaccessibleOrder = await app.inject({
+      method: "POST",
+      url: `/orders/${firstOrder.json().order.id}/confirm`,
+      headers: { cookie: secondCookie },
+      payload: { confirmed: true },
+    });
+    assert.equal(inaccessibleOrder.statusCode, 404);
+    const inaccessibleConversation = await app.inject({
+      method: "POST",
+      url: `/conversations/${firstConversation.json().conversation.id}/handoff`,
+      headers: { cookie: secondCookie },
+      payload: { reason: "Synthetic test" },
+    });
+    assert.equal(inaccessibleConversation.statusCode, 404);
+
+    const secondOrder = await app.inject({
+      method: "POST",
+      url: "/orders",
+      headers: { cookie: secondCookie },
+      payload: {
+        customerName: "Synthetic Customer Two",
+        phone: "0622345678",
+        productId: "woven-basket",
+        quantity: 1,
+        address: "Synthetic Test Address, Fes",
+      },
+    });
+    assert.equal(secondOrder.statusCode, 201);
+    const ownerSelectedStore = await app.inject({
+      method: "GET",
+      url: "/orders",
+      headers: { cookie: firstCookie, "x-store-account": "second-admin" },
+    });
+    assert.equal(ownerSelectedStore.json().orders[0]?.id, secondOrder.json().order.id);
+    const ownerManagedStore = await app.inject({
+      method: "POST",
+      url: `/orders/${secondOrder.json().order.id}/confirm`,
+      headers: { cookie: firstCookie, "x-store-account": "second-admin" },
+      payload: { confirmed: true },
+    });
+    assert.equal(ownerManagedStore.statusCode, 200);
+
+    const firstOrders = await app.inject({ method: "GET", url: "/orders", headers: { cookie: firstCookie } });
+    const firstProducts = await app.inject({ method: "GET", url: "/products", headers: { cookie: firstCookie } });
+    assert.equal(firstOrders.json().orders.length, 1);
+    assert.equal(firstProducts.json().products.find((product: { id: string }) => product.id === "argan-oil-100").stock, 2);
+  });
+
+  it("assigns existing shared data to the first account without modifying the legacy file", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "darija-desk-tenant-migration-"));
+    temporaryDirectories.push(directory);
+    const legacyFile = join(directory, "legacy-store.json");
+    const legacyState = {
+      version: 1,
+      orders: [{
+        id: "legacy-order",
+        customerName: "Synthetic Legacy Customer",
+        phone: "+212612345678",
+        productId: "argan-oil-100",
+        productName: "Argan Oil 100 ml",
+        quantity: 1,
+        unitPriceMad: 129,
+        totalMad: 129,
+        address: "Synthetic Legacy Address, Rabat",
+        status: "confirmed",
+      }],
+      conversations: [{
+        id: "legacy-conversation",
+        phone: "+212612345678",
+        status: "ai",
+        messages: [],
+      }],
+    };
+    writeFileSync(legacyFile, `${JSON.stringify(legacyState)}\n`, "utf8");
+    const originalLegacyFile = readFileSync(legacyFile, "utf8");
+    const migrationConfig = loadConfig({
+      NODE_ENV: "development",
+      LOG_LEVEL: "silent",
+      LOCAL_DATA_FILE: legacyFile,
+      SESSION_SECRET: "test-session-secret-at-least-32-characters",
+    });
+    const app = createTestApp(undefined, migrationConfig);
+
+    const first = await registerAccount(app, registrationPayload("migration-owner"));
+    assert.equal(first.verified?.statusCode, 201);
+    const firstCookie = (first.verified?.headers["set-cookie"] as string).split(";")[0] ?? "";
+    const firstOrders = await app.inject({ method: "GET", url: "/orders", headers: { cookie: firstCookie } });
+    const firstConversations = await app.inject({ method: "GET", url: "/conversations", headers: { cookie: firstCookie } });
+    assert.equal(firstOrders.json().orders[0]?.id, "legacy-order");
+    assert.equal(firstConversations.json().conversations[0]?.id, "legacy-conversation");
+
+    const second = await registerAccount(app, registrationPayload("migration-other", "migration-other@example.com", "0622345678"));
+    assert.equal(second.verified?.statusCode, 201);
+    const secondCookie = (second.verified?.headers["set-cookie"] as string).split(";")[0] ?? "";
+    const secondOrders = await app.inject({ method: "GET", url: "/orders", headers: { cookie: secondCookie } });
+    const secondConversations = await app.inject({ method: "GET", url: "/conversations", headers: { cookie: secondCookie } });
+    assert.equal(secondOrders.json().orders.length, 0);
+    assert.equal(secondConversations.json().conversations.length, 0);
+    assert.equal(readFileSync(legacyFile, "utf8"), originalLegacyFile);
+  });
+
+  it("preserves each account's orders and inventory across server restarts", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "darija-desk-tenant-restart-"));
+    temporaryDirectories.push(directory);
+    const restartConfig = loadConfig({
+      NODE_ENV: "development",
+      LOG_LEVEL: "silent",
+      LOCAL_DATA_FILE: join(directory, "store.json"),
+      SESSION_SECRET: "test-session-secret-at-least-32-characters",
+    });
+    const firstApp = createTestApp(undefined, restartConfig);
+    const registered = await registerAccount(firstApp, registrationPayload("persistent-owner"));
+    assert.equal(registered.verified?.statusCode, 201);
+    const firstCookie = (registered.verified?.headers["set-cookie"] as string).split(";")[0] ?? "";
+    const created = await firstApp.inject({
+      method: "POST",
+      url: "/orders",
+      headers: { cookie: firstCookie },
+      payload: {
+        customerName: "Synthetic Persistent Customer",
+        phone: "0612345678",
+        productId: "argan-oil-100",
+        quantity: 1,
+        address: "Synthetic Persistent Address, Rabat",
+      },
+    });
+    assert.equal(created.statusCode, 201);
+    await firstApp.inject({
+      method: "PATCH",
+      url: "/products/argan-oil-100/stock",
+      headers: { cookie: firstCookie },
+      payload: { stock: 4 },
+    });
+
+    const restartedApp = createTestApp(undefined, restartConfig);
+    const login = await restartedApp.inject({
+      method: "POST",
+      url: "/auth/login",
+      payload: { username: "persistent-owner", password: testPassword },
+    });
+    assert.equal(login.statusCode, 200);
+    const restartedCookie = (login.headers["set-cookie"] as string).split(";")[0] ?? "";
+    const restoredOrders = await restartedApp.inject({
+      method: "GET",
+      url: "/orders",
+      headers: { cookie: restartedCookie },
+    });
+    const restoredProducts = await restartedApp.inject({
+      method: "GET",
+      url: "/products",
+      headers: { cookie: restartedCookie },
+    });
+    assert.equal(restoredOrders.json().orders[0]?.id, created.json().order.id);
+    assert.equal(
+      restoredProducts.json().products.find((product: { id: string }) => product.id === "argan-oil-100").stock,
+      4,
+    );
+
+    const second = await registerAccount(
+      restartedApp,
+      registrationPayload("persistent-other", "persistent-other@example.com", "0622345678"),
+    );
+    assert.equal(second.verified?.statusCode, 201);
+    const secondCookie = (second.verified?.headers["set-cookie"] as string).split(";")[0] ?? "";
+    const secondOrders = await restartedApp.inject({
+      method: "GET",
+      url: "/orders",
+      headers: { cookie: secondCookie },
+    });
+    assert.equal(secondOrders.json().orders.length, 0);
+  });
+
   it("does not create an account when AWS SNS cannot send the verification SMS", async () => {
     const app = createTestApp({
       async sendVerificationCode() {
@@ -294,6 +533,39 @@ describe("local support prototype", () => {
       payload: { username: testUsername, password: testPassword },
     });
     assert.equal(login.statusCode, 200);
+    const session = await app.inject({
+      method: "GET",
+      url: "/auth/session",
+      headers: { cookie: (login.headers["set-cookie"] as string).split(";")[0] ?? "" },
+    });
+    assert.equal(session.json().role, "owner");
+  });
+
+  it("assigns the owner role to the first account when migrating existing multi-account files", async () => {
+    const salt = "b".repeat(64);
+    const passwordHash = scryptSync(testPassword, salt, 32).toString("hex");
+    writeFileSync(accountFile, JSON.stringify({
+      version: 2,
+      accounts: [
+        { username: "first-admin", salt, passwordHash },
+        { username: "second-admin", salt, passwordHash },
+      ],
+    }));
+    const app = createTestApp();
+    for (const [username, role] of [["first-admin", "owner"], ["second-admin", "admin"]]) {
+      const login = await app.inject({
+        method: "POST",
+        url: "/auth/login",
+        payload: { username, password: testPassword },
+      });
+      assert.equal(login.statusCode, 200);
+      const session = await app.inject({
+        method: "GET",
+        url: "/auth/session",
+        headers: { cookie: (login.headers["set-cookie"] as string).split(";")[0] ?? "" },
+      });
+      assert.equal(session.json().role, role);
+    }
   });
 
   it("validates and normalizes Moroccan phone numbers", async () => {
@@ -395,7 +667,12 @@ describe("local support prototype", () => {
     const product = findProduct("ceramic-mug");
     assert.ok(product);
     const previousStock = product.stock;
-    product.stock = 2;
+    const adjustedStock = await request(app, {
+      method: "PATCH",
+      url: "/products/ceramic-mug/stock",
+      payload: { stock: 2 },
+    });
+    assert.equal(adjustedStock.statusCode, 200);
 
     const validOrder = await request(app, {
       method: "POST",
@@ -409,7 +686,9 @@ describe("local support prototype", () => {
       },
     });
     assert.equal(validOrder.statusCode, 201);
-    assert.equal(product.stock, 0);
+    assert.equal((await request(app, { method: "GET", url: "/products" })).json().products.find(
+      (item: { id: string }) => item.id === "ceramic-mug",
+    ).stock, 0);
 
     const outOfStock = await request(app, {
       method: "POST",
@@ -431,9 +710,14 @@ describe("local support prototype", () => {
       payload: { status: "cancelled" },
     });
     assert.equal(cancelled.statusCode, 200);
-    assert.equal(product.stock, 2);
-
-    product.stock = previousStock;
+    assert.equal((await request(app, { method: "GET", url: "/products" })).json().products.find(
+      (item: { id: string }) => item.id === "ceramic-mug",
+    ).stock, 2);
+    await request(app, {
+      method: "PATCH",
+      url: "/products/ceramic-mug/stock",
+      payload: { stock: previousStock },
+    });
 
     const invalidOrder = await request(app, {
       method: "POST",
@@ -584,6 +868,7 @@ describe("local dashboard", () => {
     assert.match(dashboardHtml, /id="show-register"/);
     assert.match(dashboardHtml, /id="show-login"/);
     assert.match(dashboardHtml, /id="registration-code"/);
+    assert.match(dashboardHtml, /id="store-switcher"/);
     assert.match(dashboardHtml, /تأكيد الهاتف وإنشاء الحساب/);
   });
 

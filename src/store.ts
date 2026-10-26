@@ -1,4 +1,5 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { z } from "zod";
 
@@ -67,21 +68,33 @@ const conversationSchema = z.object({
   messages: z.array(messageSchema),
 });
 
-const persistedStateSchema = z.object({
+const legacyPersistedStateSchema = z.object({
   version: z.literal(1),
   orders: z.array(orderSchema),
   conversations: z.array(conversationSchema),
 });
+const persistedStateSchema = z.discriminatedUnion("version", [
+  legacyPersistedStateSchema,
+  legacyPersistedStateSchema.extend({
+    version: z.literal(2),
+    productStocks: z.array(z.object({
+      productId: z.string(),
+      stock: z.number().int().min(0).max(5000),
+    })),
+  }),
+]);
 
 export interface LocalStore {
   readonly orders: Map<string, Order>;
   readonly conversations: Map<string, Conversation>;
+  readonly productStocks: Map<string, number>;
   save(): void;
 }
 
 export class MemoryStore implements LocalStore {
   readonly orders = new Map<string, Order>();
   readonly conversations = new Map<string, Conversation>();
+  readonly productStocks = new Map<string, number>();
 
   save(): void {}
 }
@@ -89,12 +102,22 @@ export class MemoryStore implements LocalStore {
 export class JsonFileStore implements LocalStore {
   readonly orders = new Map<string, Order>();
   readonly conversations = new Map<string, Conversation>();
+  readonly productStocks = new Map<string, number>();
   private readonly filePath: string;
 
-  constructor(filePath: string) {
+  constructor(filePath: string, legacyFilePath?: string) {
     this.filePath = resolve(filePath);
     try {
-      const parsed: unknown = JSON.parse(readFileSync(this.filePath, "utf8"));
+      let sourcePath = this.filePath;
+      let contents: string;
+      try {
+        contents = readFileSync(sourcePath, "utf8");
+      } catch (error) {
+        if (!isMissingFile(error) || !legacyFilePath) throw error;
+        sourcePath = resolve(legacyFilePath);
+        contents = readFileSync(sourcePath, "utf8");
+      }
+      const parsed: unknown = JSON.parse(contents);
       const state = persistedStateSchema.parse(parsed);
       for (const order of state.orders) this.orders.set(order.id, order);
       for (const conversation of state.conversations) {
@@ -107,6 +130,11 @@ export class JsonFileStore implements LocalStore {
         };
         this.conversations.set(value.id, value);
       }
+      if (state.version === 2) {
+        for (const productStock of state.productStocks) {
+          this.productStocks.set(productStock.productId, productStock.stock);
+        }
+      }
     } catch (error) {
       if (isMissingFile(error)) return;
       throw new Error(`Unable to load local data file "${this.filePath}".`, { cause: error });
@@ -115,9 +143,10 @@ export class JsonFileStore implements LocalStore {
 
   save(): void {
     const state = {
-      version: 1 as const,
+      version: 2 as const,
       orders: [...this.orders.values()],
       conversations: [...this.conversations.values()],
+      productStocks: [...this.productStocks].map(([productId, stock]) => ({ productId, stock })),
     };
     const directory = dirname(this.filePath);
     const temporaryPath = `${this.filePath}.${process.pid}.tmp`;
@@ -133,4 +162,18 @@ function isMissingFile(error: unknown): boolean {
 
 export function createLocalStore(nodeEnv: string, filePath: string): LocalStore {
   return nodeEnv === "test" ? new MemoryStore() : new JsonFileStore(filePath);
+}
+
+export function createAccountStore(
+  nodeEnv: string,
+  filePath: string,
+  username: string,
+  legacyOwnerUsername?: string,
+): LocalStore {
+  if (nodeEnv === "test") return new MemoryStore();
+  const accountId = createHash("sha256").update(username.toLocaleLowerCase()).digest("hex");
+  const tenantFilePath = `${resolve(filePath)}.accounts/${accountId}.json`;
+  const ownsLegacyData = legacyOwnerUsername !== undefined
+    && username.toLocaleLowerCase() === legacyOwnerUsername.toLocaleLowerCase();
+  return new JsonFileStore(tenantFilePath, ownsLegacyData ? filePath : undefined);
 }

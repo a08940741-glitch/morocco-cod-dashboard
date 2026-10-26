@@ -1,4 +1,4 @@
-﻿import { products } from "./catalog.js";
+import { products, type Product } from "./catalog.js";
 
 export interface OutboundMessage {
   to: string;
@@ -6,15 +6,15 @@ export interface OutboundMessage {
   sentAt: string;
 }
 
-function formatCatalogPriceList(): string {
-  return products
+function formatCatalogPriceList(catalog: Product[]): string {
+  return catalog
     .map((product) => `${product.name}: ${product.priceMad} درهم | المخزون: ${product.stock} قطعة`)
     .join("؛ ");
 }
 
-function findProductByText(input: string) {
+function findProductByText(input: string, catalog: Product[]) {
   const normalized = input.toLocaleLowerCase("fr");
-  return products.find((product) => {
+  return catalog.find((product) => {
     const name = product.name.toLocaleLowerCase("fr");
     const id = product.id.toLocaleLowerCase("fr");
     const haystack = `${name} ${product.description}`.toLocaleLowerCase("fr");
@@ -31,7 +31,7 @@ export class MockWhatsAppAdapter {
 }
 
 export class MockClaudeProvider {
-  async reply(message: string): Promise<string> {
+  async reply(message: string, catalog: Product[] = products): Promise<string> {
     const text = (message ?? "").trim();
     if (!text) {
       return "مرحبا! أستطيع مساعدتك في الأسعار، التوصيل، الدفع عند الاستلام، وتسجيل الطلبات التجريبية.";
@@ -52,13 +52,13 @@ export class MockClaudeProvider {
         return "التوصيل محاكاة محلية، والرسوم التقديرية هي 25 درهم لكل طلب مسلّم. الدفع عند الاستلام (COD) متاح، والطلب يبقى في انتظار تأكيدك الصريح.";
       }
       if (/مخزون|متوفر|التوفر|stock|disponible|available/.test(normalized)) {
-        return `حالة المخزون الحالية: ${products.map((product) => `${product.name}: ${product.stock} قطعة`).join("؛ ")}.`;
+        return `حالة المخزون الحالية: ${catalog.map((product) => `${product.name}: ${product.stock} قطعة`).join("؛ ")}.`;
       }
       if (/ثمن|سعر|prix|بكم|بشحال|كم|قدر|كلفة/.test(normalized)) {
-        const product = findProductByText(text) ?? products[0];
+        const product = findProductByText(text, catalog) ?? catalog[0];
         return product
           ? `${product.name} غالي بـ ${product.priceMad} درهم و${product.stock > 0 ? `متوفر (${product.stock} قطعة)` : "غير متوفر الآن"}.`
-          : `أسعار المنتجات الحالية: ${formatCatalogPriceList()}.`;
+          : `أسعار المنتجات الحالية: ${formatCatalogPriceList(catalog)}.`;
       }
       if (/طلب|commande|حالة|status|suivi|تتبع/.test(normalized)) {
         return "يمكن متابعة الطلب من لوحة الإدارة المحلية. في هذا النموذج، الحالة تتغير يدويًا بين: انتظار التأكيد، مؤكد، قيد التجهيز، شحن، تسليم، أو ملغى.";
@@ -67,7 +67,7 @@ export class MockClaudeProvider {
         return "الدفع عند الاستلام (COD) هو الخيار المسمور في هذا النموذج. يجب تأكيد الطلب صراحة قبل أن يصبح مؤكدًا.";
       }
       if (/منتج|catalogue|catalog|منتجات|قائمة/.test(normalized)) {
-        return `قائمة المنتجات الحالية: ${formatCatalogPriceList()}.`;
+        return `قائمة المنتجات الحالية: ${formatCatalogPriceList(catalog)}.`;
       }
       return "مرحبا! أستطيع مساعدتك في أسعار المنتجات، المخزون، التوصيل، والدفع عند الاستلام. إذا أردت، أستطيع تحويل المحادثة إلى موظف.";
     }
@@ -77,13 +77,13 @@ export class MockClaudeProvider {
         return "La livraison est simulée dans cette démo locale. Pour un colis, le statut est visible dans le tableau de bord et le paiement est à la livraison (COD).";
       }
       if (/stock|disponible|quantite|quantité|available/.test(normalized)) {
-        return `Disponibilité actuelle: ${products.map((product) => `${product.name}: ${product.stock} pièces`).join("; ")}.`;
+        return `Disponibilité actuelle: ${catalog.map((product) => `${product.name}: ${product.stock} pièces`).join("; ")}.`;
       }
       if (/prix|tarif|coût|cout|payer|combien|montant/.test(normalized)) {
-        const product = findProductByText(text) ?? products[0];
+        const product = findProductByText(text, catalog) ?? catalog[0];
         return product
           ? `${product.name} coûte ${product.priceMad} MAD et ${product.stock > 0 ? `est disponible (${product.stock} pièces)` : "n'est plus disponible"}.`
-          : `Prix du catalogue: ${formatCatalogPriceList().replace(/درهم/g, "MAD").replace(/؛/g, "; ")}.`;
+          : `Prix du catalogue: ${formatCatalogPriceList(catalog).replace(/درهم/g, "MAD").replace(/؛/g, "; ")}.`;
       }
       if (/commande|suivi|statut|ordre/.test(normalized)) {
         return "Le statut de la commande est géré localement dans le tableau de bord: attente de confirmation, confirmé, préparation, expédié, livré ou annulé.";
@@ -92,7 +92,7 @@ export class MockClaudeProvider {
         return "Le paiement à la livraison (COD) est le mode pris en charge dans cette démo. La commande doit être confirmée explicitement.";
       }
       if (/produit|catalogue|produits/.test(normalized)) {
-        return `Catalogue local: ${products.map((product) => `${product.name} ${product.priceMad} MAD`).join("; ")}.`;
+        return `Catalogue local: ${catalog.map((product) => `${product.name} ${product.priceMad} MAD`).join("; ")}.`;
       }
       return "Bonjour ! Je peux vous aider sur les prix, la disponibilité, le COD et le suivi des commandes. Demandez un transfert vers un agent si nécessaire.";
     }
